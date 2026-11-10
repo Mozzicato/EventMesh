@@ -1,0 +1,33 @@
+# Local dependencies for EventMesh. Sized for an 8 GB laptop.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: eventmesh
+      POSTGRES_PASSWORD: eventmesh
+      POSTGRES_DB: eventmesh
+    # fsync and synchronous_commit stay ON (defaults): every commit is durable,
+    # so the load-test numbers are honest.
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=60"]
+    ports: ["5432:5432"]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eventmesh"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # Redis only holds job IDs; Postgres is the source of truth and the sweeper
+    # rebuilds Redis from it, so Redis persistence is off.
+    # noeviction: never silently drop queue entries when memory is full.
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    mem_limit: 192m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

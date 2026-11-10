@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: eventmesh
+          POSTGRES_PASSWORD: eventmesh
+          POSTGRES_DB: eventmesh
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U eventmesh"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      EVENTMESH_TEST_PG: postgres://eventmesh:eventmesh@localhost:5432/eventmesh?sslmode=disable&pool_max_conns=20
+      EVENTMESH_TEST_REDIS: localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./...
+      - name: Test (race detector)
+        run: go test -race -count=1 ./...

@@ -1,0 +1,8 @@
+# Private interview prep (never committed)
+prep/
+
+# Build output
+/bin/
+*.exe
+*.test
+*.out
