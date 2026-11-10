@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Mozzicato/EventMesh/internal/store"
 	"github.com/Mozzicato/EventMesh/internal/testutil"
 )
@@ -156,5 +158,47 @@ func TestGetJob_ReturnsStoredFields(t *testing.T) {
 	// Postgres stores microseconds; compare at that precision.
 	if !got.ReceivedAt.Equal(nj.ReceivedAt.Truncate(time.Microsecond)) {
 		t.Fatalf("received_at %v, want %v", got.ReceivedAt, nj.ReceivedAt)
+	}
+}
+
+// Regression test for a bug CI caught: CREATE TABLE IF NOT EXISTS is not safe
+// when several processes apply the schema at once. Open must serialise it.
+// Runs in a throwaway Postgres schema so it never touches the shared tables.
+func TestOpen_ConcurrentSchemaSetupIsSafe(t *testing.T) {
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, testutil.PostgresDSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schema := "schema_race_" + testutil.RandomID()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE")
+
+	dsn := testutil.PostgresDSN() + "&search_path=" + schema
+	const n = 10
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s, err := store.Open(ctx, dsn)
+			if err != nil {
+				errs <- err
+				return
+			}
+			s.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Open failed: %v", err)
 	}
 }

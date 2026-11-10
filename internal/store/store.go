@@ -86,11 +86,33 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
+	if err := applySchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 	return &Store{pool: pool}, nil
+}
+
+// schemaLockID is an arbitrary constant naming the advisory lock below.
+const schemaLockID = 727274
+
+// applySchema runs schema.sql while holding a transaction-scoped advisory lock.
+// "CREATE TABLE IF NOT EXISTS" is not safe when two processes run it at the
+// same moment (both see no table, both create, one fails), which happens when
+// several servers or test packages start together. The lock serialises them.
+func applySchema(ctx context.Context, pool *pgxpool.Pool) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // no-op after Commit
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", schemaLockID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, schemaSQL); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // Close releases all connections.
