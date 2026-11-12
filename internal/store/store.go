@@ -251,6 +251,16 @@ func (s *Store) MarkDead(ctx context.Context, job Job, now time.Time, reason str
 	return tag.RowsAffected() == 1, err
 }
 
+// MarkRetrying records a failed attempt that will be retried at runAt.
+func (s *Store) MarkRetrying(ctx context.Context, job Job, now, runAt time.Time, reason string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'retrying', last_error = $3, run_at = $4, updated_at = $5, lease_until = NULL
+		WHERE id = $1 AND status = 'running' AND attempts = $2`,
+		job.ID, job.Attempts, reason, runAt, now)
+	return tag.RowsAffected() == 1, err
+}
+
 // KillExhaustedLeases dead-letters running jobs whose lease expired on their
 // final attempt (their worker died and no attempts are left). Without this,
 // Claim would refuse them forever and they would be stuck in running.

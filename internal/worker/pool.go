@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/Mozzicato/EventMesh/internal/queue"
+	"github.com/Mozzicato/EventMesh/internal/retry"
 	"github.com/Mozzicato/EventMesh/internal/store"
 )
 
@@ -39,6 +40,8 @@ type Config struct {
 	DequeueTimeout time.Duration // how long one BRPOP blocks; bounds shutdown delay
 	SweepInterval  time.Duration // how often the sweeper scans Postgres
 	StaleAfter     time.Duration // pending/retrying jobs older than this are re-enqueued
+	Retry          retry.Policy  // backoff between attempts
+	PromoteEvery   time.Duration // how often due retries are moved to the ready list
 }
 
 func (c Config) withDefaults() Config {
@@ -66,6 +69,12 @@ func (c Config) withDefaults() Config {
 	if c.StaleAfter <= 0 {
 		c.StaleAfter = time.Minute
 	}
+	if c.Retry.Base <= 0 && c.Retry.Cap <= 0 {
+		c.Retry = retry.Policy{Base: time.Second, Cap: 5 * time.Minute}
+	}
+	if c.PromoteEvery <= 0 {
+		c.PromoteEvery = 100 * time.Millisecond
+	}
 	return c
 }
 
@@ -87,14 +96,25 @@ type Pool struct {
 	cfg Config // Config with defaults applied; set once at the start of Run
 }
 
-// Run processes jobs until ctx is cancelled, then shuts down: it stops taking
-// work from Redis, waits for in-flight jobs to finish, and pushes ids that
-// were fetched but never started back to the front of the Redis queue.
-func (p *Pool) Run(ctx context.Context) error {
+// setup applies defaults and validates the config.
+func (p *Pool) setup() error {
 	p.cfg = p.Config.withDefaults()
 	if p.cfg.Lease <= p.cfg.JobTimeout {
 		return errors.New("worker: Lease must be longer than JobTimeout, " +
 			"or healthy jobs would be reclaimed while still running")
+	}
+	if p.cfg.Retry.Cap < p.cfg.Retry.Base {
+		return errors.New("worker: Retry.Cap must be at least Retry.Base")
+	}
+	return nil
+}
+
+// Run processes jobs until ctx is cancelled, then shuts down: it stops taking
+// work from Redis, waits for in-flight jobs to finish, and pushes ids that
+// were fetched but never started back to the front of the Redis queue.
+func (p *Pool) Run(ctx context.Context) error {
+	if err := p.setup(); err != nil {
+		return err
 	}
 
 	jobs := make(chan int64, p.cfg.Buffer)
@@ -108,16 +128,20 @@ func (p *Pool) Run(ctx context.Context) error {
 		}()
 	}
 
-	var sweeper sync.WaitGroup
-	sweeper.Add(1)
+	var background sync.WaitGroup
+	background.Add(2)
 	go func() {
-		defer sweeper.Done()
+		defer background.Done()
 		p.sweepLoop(ctx)
+	}()
+	go func() {
+		defer background.Done()
+		p.promoteLoop(ctx)
 	}()
 
 	p.fetch(ctx, jobs) // returns once ctx is cancelled
 	workers.Wait()
-	sweeper.Wait()
+	background.Wait()
 
 	// Only this goroutine sends on jobs, and the fetcher has returned, so it
 	// is safe to close and drain whatever is still buffered.
@@ -208,10 +232,46 @@ func (p *Pool) process(id int64) {
 	p.fail(ctx, job, runErr)
 }
 
-// fail records a failed attempt.
+// PermanentError marks a failure that retrying cannot fix (a malformed
+// payload, an unknown job type). The job goes straight to the dead-letter
+// queue instead of burning its remaining attempts.
+type PermanentError struct{ Err error }
+
+func (e *PermanentError) Error() string { return "permanent: " + e.Err.Error() }
+func (e *PermanentError) Unwrap() error { return e.Err }
+
+// Permanent wraps err so the job is not retried.
+func Permanent(err error) error { return &PermanentError{Err: err} }
+
+// fail records a failed attempt: either schedule a retry with backoff, or,
+// when attempts are used up or the error is permanent, dead-letter the job.
 func (p *Pool) fail(ctx context.Context, job store.Job, runErr error) {
-	if _, err := p.Store.MarkDead(ctx, job, p.Now(), runErr.Error()); err != nil {
-		p.Log.Error("record failure failed", "job_id", job.ID, "err", err)
+	now := p.Now()
+	var permanent *PermanentError
+	if job.Attempts >= job.MaxAttempts || errors.As(runErr, &permanent) {
+		if _, err := p.Store.MarkDead(ctx, job, now, runErr.Error()); err != nil {
+			p.Log.Error("dead-letter failed", "job_id", job.ID, "err", err)
+		}
+		return
+	}
+
+	runAt := now.Add(p.cfg.Retry.Delay(job.Attempts))
+	// Postgres first: if this write is refused (our claim is stale) we must
+	// not schedule anything. If we crash after it but before Schedule, the
+	// sweeper finds the retrying job once it is overdue.
+	ok, err := p.Store.MarkRetrying(ctx, job, now, runAt, runErr.Error())
+	if err != nil || !ok {
+		if err != nil {
+			p.Log.Error("record retry failed", "job_id", job.ID, "err", err)
+		}
+		return
+	}
+	// Fresh timeout: a slow Postgres write above must not leave this call
+	// with an already-expired context.
+	rctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+	if err := p.Queue.Schedule(rctx, p.cfg.Queue, job.ID, runAt); err != nil {
+		p.Log.Error("schedule retry failed; sweeper will recover it", "job_id", job.ID, "err", err)
 	}
 }
 
@@ -220,7 +280,7 @@ func (p *Pool) fail(ctx context.Context, job store.Job, runErr error) {
 func (p *Pool) runHandler(job store.Job) (err error) {
 	h, ok := p.Handlers[job.Type]
 	if !ok {
-		return fmt.Errorf("no handler for job type %q", job.Type)
+		return Permanent(fmt.Errorf("no handler for job type %q", job.Type))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.JobTimeout)
 	defer cancel()
@@ -239,6 +299,23 @@ func (p *Pool) handBack(id int64) {
 	if err := p.Queue.PushFront(ctx, p.cfg.Queue, id); err != nil {
 		// Still safe: the job is pending in Postgres and the sweeper finds it.
 		p.Log.Error("hand back failed; sweeper will recover it", "job_id", id, "err", err)
+	}
+}
+
+// promoteLoop moves retries whose backoff has elapsed onto the ready list.
+func (p *Pool) promoteLoop(ctx context.Context) {
+	ticker := time.NewTicker(p.cfg.PromoteEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := p.Queue.PromoteDue(ctx, p.cfg.Queue, p.Now(), 1000); err != nil &&
+				ctx.Err() == nil {
+				p.Log.Error("promote due retries", "err", err)
+			}
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ services:
     command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=60"]
     ports: ["5432:5432"]
     mem_limit: 512m
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U eventmesh"]
       interval: 2s
@@ -26,6 +27,7 @@ services:
               "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
     ports: ["6379:6379"]
     mem_limit: 192m
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s

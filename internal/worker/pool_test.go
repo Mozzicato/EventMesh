@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Mozzicato/EventMesh/internal/queue"
+	"github.com/Mozzicato/EventMesh/internal/retry"
 	"github.com/Mozzicato/EventMesh/internal/store"
 	"github.com/Mozzicato/EventMesh/internal/testutil"
 	"github.com/Mozzicato/EventMesh/internal/worker"
@@ -364,5 +365,50 @@ func waitUntil(t *testing.T, cond func() bool) {
 			t.Fatal("condition not reached within 10s")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// End to end with the real clock and background goroutines: a job that fails
+// twice is retried through the delayed set and then succeeds.
+func TestPool_RetriesWithBackoffThenSucceeds(t *testing.T) {
+	var calls atomic.Int32
+	flaky := func(context.Context, json.RawMessage) error {
+		if calls.Add(1) <= 2 {
+			return errors.New("not yet")
+		}
+		return nil
+	}
+	e := newEnv(t, map[string]worker.Handler{"flaky": flaky}, worker.Config{
+		Workers:      2,
+		Retry:        retry.Policy{Base: 20 * time.Millisecond, Cap: 100 * time.Millisecond},
+		PromoteEvery: 10 * time.Millisecond,
+	})
+	e.start()
+	id := e.submit("flaky", 5)
+	e.waitStatus(store.StatusSucceeded, id)
+	if j := e.job(id); j.Attempts != 3 || calls.Load() != 3 {
+		t.Fatalf("attempts %d, handler calls %d; want 3 and 3", j.Attempts, calls.Load())
+	}
+}
+
+func TestPool_PermanentErrorSkipsRemainingAttempts(t *testing.T) {
+	var calls atomic.Int32
+	bad := func(context.Context, json.RawMessage) error {
+		calls.Add(1)
+		return worker.Permanent(errors.New("payload missing field"))
+	}
+	e := newEnv(t, map[string]worker.Handler{"bad": bad}, worker.Config{Workers: 1})
+	e.start()
+	id := e.submit("bad", 5)
+	e.waitStatus(store.StatusDead, id)
+	if j := e.job(id); j.Attempts != 1 || calls.Load() != 1 {
+		t.Fatalf("attempts %d, calls %d; want 1 and 1 (no retries)", j.Attempts, calls.Load())
+	}
+}
+
+func TestPool_RejectsRetryCapBelowBase(t *testing.T) {
+	e := newEnv(t, nil, worker.Config{Retry: retry.Policy{Base: time.Second, Cap: time.Millisecond}})
+	if err := e.pool.Run(context.Background()); err == nil {
+		t.Fatal("Run should refuse Retry.Cap < Retry.Base")
 	}
 }

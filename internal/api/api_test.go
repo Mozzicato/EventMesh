@@ -272,3 +272,53 @@ func TestHealthz(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+func TestDLQ_ListsDeadJobsWithTheirError(t *testing.T) {
+	ts := newServer(t, &fakeQueue{})
+	_, created := post(t, ts.Client(), ts.URL, "", body)
+
+	// Kill the job directly through the store, as a worker would.
+	st := testutil.Store(t)
+	ctx := context.Background()
+	now := time.Now()
+	claimed, ok, err := st.Claim(ctx, created.ID, now, now.Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if _, err := st.MarkDead(ctx, claimed, now, "gave up"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := ts.Client().Get(ts.URL + "/dlq?limit=1000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var dead []store.Job
+	if err := json.NewDecoder(resp.Body).Decode(&dead); err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range dead {
+		if j.ID == created.ID {
+			if j.Status != store.StatusDead || j.LastError == nil || *j.LastError != "gave up" {
+				t.Fatalf("unexpected DLQ entry %+v", j)
+			}
+			return
+		}
+	}
+	t.Fatalf("dead job %d not in /dlq", created.ID)
+}
+
+func TestDLQ_RejectsBadLimit(t *testing.T) {
+	ts := newServer(t, &fakeQueue{})
+	for _, q := range []string{"0", "-1", "1001", "abc"} {
+		resp, err := ts.Client().Get(ts.URL + "/dlq?limit=" + q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("limit=%s: status %d, want 400", q, resp.StatusCode)
+		}
+	}
+}

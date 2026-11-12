@@ -229,3 +229,46 @@ func TestKillExhaustedLeases_DeadLettersLostFinalAttempt(t *testing.T) {
 		t.Fatalf("job with attempts left: status %s, want running", got.Status)
 	}
 }
+
+func TestMarkRetrying_JobIsNotClaimableBeforeRunAt(t *testing.T) {
+	s := testutil.Store(t)
+	ctx := context.Background()
+	job := createIn(t, s, "q-"+testutil.RandomID(), 3)
+	claimed, _ := claim(t, s, job.ID, t0)
+	runAt := t0.Add(10 * time.Second)
+	if ok, err := s.MarkRetrying(ctx, claimed, t0, runAt, "flaky"); err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	got, _ := s.GetJob(ctx, job.ID)
+	if got.Status != store.StatusRetrying || !got.RunAt.Equal(runAt) || got.LeaseUntil != nil ||
+		got.LastError == nil || *got.LastError != "flaky" {
+		t.Fatalf("unexpected retrying job: %+v", got)
+	}
+	if _, ok := claim(t, s, job.ID, runAt.Add(-time.Millisecond)); ok {
+		t.Fatal("a retrying job must not be claimable before run_at (backoff ignored)")
+	}
+	again, ok := claim(t, s, job.ID, runAt)
+	if !ok || again.Attempts != 2 {
+		t.Fatalf("claim at run_at: ok=%v attempts=%d; want true, 2", ok, again.Attempts)
+	}
+}
+
+func TestStrandedJobIDs_FindsRetryLostFromRedis(t *testing.T) {
+	s := testutil.Store(t)
+	ctx := context.Background()
+	queue := "q-" + testutil.RandomID()
+	job := createIn(t, s, queue, 3)
+	claimed, _ := claim(t, s, job.ID, t0)
+	runAt := t0.Add(time.Second)
+	_, _ = s.MarkRetrying(ctx, claimed, t0, runAt, "x")
+
+	// Shortly after run_at, the promoter should have handled it: not stranded.
+	if ids, _ := s.StrandedJobIDs(ctx, queue, runAt.Add(time.Second), time.Minute, 10); len(ids) != 0 {
+		t.Fatalf("retry reported stranded too early: %v", ids)
+	}
+	// Long past run_at and still retrying: Redis must have lost it.
+	ids, _ := s.StrandedJobIDs(ctx, queue, runAt.Add(2*time.Minute), time.Minute, 10)
+	if len(ids) != 1 || ids[0] != job.ID {
+		t.Fatalf("got %v, want [%d]", ids, job.ID)
+	}
+}
