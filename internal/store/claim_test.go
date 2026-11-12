@@ -272,3 +272,26 @@ func TestStrandedJobIDs_FindsRetryLostFromRedis(t *testing.T) {
 		t.Fatalf("got %v, want [%d]", ids, job.ID)
 	}
 }
+
+func TestRelease_JobBecomesPendingAndAttemptIsNotCounted(t *testing.T) {
+	s := testutil.Store(t)
+	ctx := context.Background()
+	job := createIn(t, s, "q-"+testutil.RandomID(), 3)
+	claimed, _ := claim(t, s, job.ID, t0)
+	if ok, err := s.Release(ctx, claimed, t0); err != nil || !ok {
+		t.Fatalf("release: ok=%v err=%v", ok, err)
+	}
+	got, _ := s.GetJob(ctx, job.ID)
+	if got.Status != store.StatusPending || got.Attempts != 0 || got.LeaseUntil != nil {
+		t.Fatalf("after release: %+v", got)
+	}
+	// Immediately claimable again, as attempt 1.
+	again, ok := claim(t, s, job.ID, t0)
+	if !ok || again.Attempts != 1 {
+		t.Fatalf("re-claim: ok=%v attempts=%d", ok, again.Attempts)
+	}
+	// A stale claim (attempt number moved on) cannot release.
+	if ok, _ := s.Release(ctx, claimed, t0); ok {
+		t.Fatal("release with a stale attempt number must affect nothing")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,7 +50,7 @@ func newEnv(t *testing.T, handlers map[string]worker.Handler, cfg worker.Config)
 		Handlers: handlers,
 		Config:   cfg,
 		Now:      time.Now,
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log:      testLogger(),
 	}
 	return e
 }
@@ -411,4 +412,13 @@ func TestPool_RejectsRetryCapBelowBase(t *testing.T) {
 	if err := e.pool.Run(context.Background()); err == nil {
 		t.Fatal("Run should refuse Retry.Cap < Retry.Base")
 	}
+}
+
+// testLogger discards pool logs unless EVENTMESH_TEST_LOG is set, which is
+// handy when debugging a failing test.
+func testLogger() *slog.Logger {
+	if os.Getenv("EVENTMESH_TEST_LOG") != "" {
+		return slog.New(slog.NewTextHandler(os.Stderr, nil))
+	}
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

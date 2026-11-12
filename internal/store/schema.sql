@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     status          TEXT        NOT NULL
                     CHECK (status IN ('pending', 'running', 'retrying', 'succeeded', 'dead')),
     attempts        INT         NOT NULL DEFAULT 0,
+    -- Incremented by every claim and never decreased: the fencing token that
+    -- finishing writes must match (see store.go).
+    claim_token     BIGINT      NOT NULL DEFAULT 0,
     max_attempts    INT         NOT NULL CHECK (max_attempts >= 1),
     last_error      TEXT,
     -- When the API received the request; the start of end-to-end latency.
@@ -28,3 +31,6 @@ CREATE INDEX IF NOT EXISTS jobs_unfinished_idx ON jobs (queue, status)
     WHERE status IN ('pending', 'running', 'retrying');
 
 CREATE INDEX IF NOT EXISTS jobs_dead_idx ON jobs (id) WHERE status = 'dead';
+
+-- Upgrade databases created before claim_token existed.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS claim_token BIGINT NOT NULL DEFAULT 0;

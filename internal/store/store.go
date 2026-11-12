@@ -48,6 +48,7 @@ type Job struct {
 	Payload        json.RawMessage `json:"payload"`
 	Status         string          `json:"status"`
 	Attempts       int             `json:"attempts"`
+	ClaimToken     int64           `json:"claim_token"`
 	MaxAttempts    int             `json:"max_attempts"`
 	LastError      *string         `json:"last_error,omitempty"`
 	ReceivedAt     time.Time       `json:"received_at"`
@@ -67,14 +68,14 @@ type NewJob struct {
 	ReceivedAt     time.Time
 }
 
-const jobColumns = `id, idempotency_key, queue, type, payload, status, attempts, max_attempts,
+const jobColumns = `id, idempotency_key, queue, type, payload, status, attempts, claim_token, max_attempts,
 	last_error, received_at, updated_at, run_at, lease_until, finished_at`
 
 // scanJob reads jobColumns, plus any extra destinations appended at the end.
 func scanJob(row pgx.Row, extra ...any) (Job, error) {
 	var j Job
 	dest := []any{&j.ID, &j.IdempotencyKey, &j.Queue, &j.Type, &j.Payload, &j.Status,
-		&j.Attempts, &j.MaxAttempts, &j.LastError, &j.ReceivedAt, &j.UpdatedAt, &j.RunAt,
+		&j.Attempts, &j.ClaimToken, &j.MaxAttempts, &j.LastError, &j.ReceivedAt, &j.UpdatedAt, &j.RunAt,
 		&j.LeaseUntil, &j.FinishedAt}
 	err := row.Scan(append(dest, extra...)...)
 	return j, err
@@ -209,7 +210,8 @@ func (s *Store) ListDead(ctx context.Context, limit int) ([]Job, error) {
 func (s *Store) Claim(ctx context.Context, id int64, now, leaseUntil time.Time) (Job, bool, error) {
 	job, err := scanJob(s.pool.QueryRow(ctx, `
 		UPDATE jobs
-		SET status = 'running', attempts = attempts + 1, lease_until = $3, updated_at = $2
+		SET status = 'running', attempts = attempts + 1, claim_token = claim_token + 1,
+		    lease_until = $3, updated_at = $2
 		WHERE id = $1
 		  AND attempts < max_attempts
 		  AND (status = 'pending'
@@ -226,9 +228,11 @@ func (s *Store) Claim(ctx context.Context, id int64, now, leaseUntil time.Time) 
 }
 
 // The finishing updates below only apply if the job is still running under the
-// same attempt the caller claimed. If the lease expired and another worker
-// re-claimed the job, attempts has moved on and the stale worker's write
-// affects no rows. The attempt number acts as a fencing token.
+// same claim the caller made. Every claim increments claim_token. If the lease
+// expired and another worker re-claimed the job, the token has moved on and the
+// stale worker's write affects no rows: claim_token is a fencing token. (It is
+// separate from attempts because Release gives an interrupted attempt back,
+// so attempts can repeat; the token never does.)
 
 // Succeed marks a claimed job as succeeded. ok=false means the caller's claim
 // was stale and nothing was written.
@@ -236,8 +240,8 @@ func (s *Store) Succeed(ctx context.Context, job Job, now time.Time) (bool, erro
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE jobs
 		SET status = 'succeeded', finished_at = $3, updated_at = $3, lease_until = NULL
-		WHERE id = $1 AND status = 'running' AND attempts = $2`,
-		job.ID, job.Attempts, now)
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`,
+		job.ID, job.ClaimToken, now)
 	return tag.RowsAffected() == 1, err
 }
 
@@ -246,8 +250,8 @@ func (s *Store) MarkDead(ctx context.Context, job Job, now time.Time, reason str
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE jobs
 		SET status = 'dead', last_error = $3, finished_at = $4, updated_at = $4, lease_until = NULL
-		WHERE id = $1 AND status = 'running' AND attempts = $2`,
-		job.ID, job.Attempts, reason, now)
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`,
+		job.ID, job.ClaimToken, reason, now)
 	return tag.RowsAffected() == 1, err
 }
 
@@ -256,8 +260,20 @@ func (s *Store) MarkRetrying(ctx context.Context, job Job, now, runAt time.Time,
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE jobs
 		SET status = 'retrying', last_error = $3, run_at = $4, updated_at = $5, lease_until = NULL
-		WHERE id = $1 AND status = 'running' AND attempts = $2`,
-		job.ID, job.Attempts, reason, runAt, now)
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`,
+		job.ID, job.ClaimToken, reason, runAt, now)
+	return tag.RowsAffected() == 1, err
+}
+
+// Release hands a claimed job back unfinished (used when shutdown interrupts
+// it). The job becomes pending again and the interrupted attempt is not
+// counted, because the job did not fail: we stopped it.
+func (s *Store) Release(ctx context.Context, job Job, now time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'pending', attempts = attempts - 1, lease_until = NULL, updated_at = $3
+		WHERE id = $1 AND status = 'running' AND claim_token = $2`,
+		job.ID, job.ClaimToken, now)
 	return tag.RowsAffected() == 1, err
 }
 

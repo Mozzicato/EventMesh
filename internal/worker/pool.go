@@ -42,6 +42,7 @@ type Config struct {
 	StaleAfter     time.Duration // pending/retrying jobs older than this are re-enqueued
 	Retry          retry.Policy  // backoff between attempts
 	PromoteEvery   time.Duration // how often due retries are moved to the ready list
+	ShutdownGrace  time.Duration // how long in-flight jobs may run after shutdown starts
 }
 
 func (c Config) withDefaults() Config {
@@ -75,6 +76,9 @@ func (c Config) withDefaults() Config {
 	if c.PromoteEvery <= 0 {
 		c.PromoteEvery = 100 * time.Millisecond
 	}
+	if c.ShutdownGrace <= 0 {
+		c.ShutdownGrace = 10 * time.Second
+	}
 	return c
 }
 
@@ -94,11 +98,17 @@ type Pool struct {
 	OnSucceeded func(job store.Job, committedAt time.Time)
 
 	cfg Config // Config with defaults applied; set once at the start of Run
+
+	// handlerCtx is the parent of every handler's context. Shutdown cancels it
+	// once ShutdownGrace has passed, to interrupt jobs that are still running.
+	handlerCtx     context.Context
+	cancelHandlers context.CancelFunc
 }
 
 // setup applies defaults and validates the config.
 func (p *Pool) setup() error {
 	p.cfg = p.Config.withDefaults()
+	p.handlerCtx, p.cancelHandlers = context.WithCancel(context.Background())
 	if p.cfg.Lease <= p.cfg.JobTimeout {
 		return errors.New("worker: Lease must be longer than JobTimeout, " +
 			"or healthy jobs would be reclaimed while still running")
@@ -109,9 +119,12 @@ func (p *Pool) setup() error {
 	return nil
 }
 
-// Run processes jobs until ctx is cancelled, then shuts down: it stops taking
-// work from Redis, waits for in-flight jobs to finish, and pushes ids that
-// were fetched but never started back to the front of the Redis queue.
+// Run processes jobs until ctx is cancelled, then shuts down gracefully:
+//  1. stop taking work from Redis;
+//  2. let in-flight jobs finish, for up to ShutdownGrace;
+//  3. after that, cancel the remaining handlers and release their jobs
+//     (pending again, attempt not counted, id back in Redis);
+//  4. push ids that were fetched but never started back to the front of Redis.
 func (p *Pool) Run(ctx context.Context) error {
 	if err := p.setup(); err != nil {
 		return err
@@ -140,7 +153,13 @@ func (p *Pool) Run(ctx context.Context) error {
 	}()
 
 	p.fetch(ctx, jobs) // returns once ctx is cancelled
+
+	// Shutdown has started. In-flight jobs get ShutdownGrace to finish; after
+	// that their contexts are cancelled and process() releases them.
+	grace := time.AfterFunc(p.cfg.ShutdownGrace, p.cancelHandlers)
 	workers.Wait()
+	grace.Stop()
+	p.cancelHandlers()
 	background.Wait()
 
 	// Only this goroutine sends on jobs, and the fetcher has returned, so it
@@ -196,7 +215,7 @@ func (p *Pool) work(ctx context.Context, jobs <-chan int64) {
 
 // process claims, runs and finishes one job. It deliberately does not take
 // the pool's context: a job that has started is allowed to finish during
-// shutdown.
+// shutdown (up to ShutdownGrace, enforced through handlerCtx).
 func (p *Pool) process(id int64) {
 	now := p.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
@@ -213,6 +232,13 @@ func (p *Pool) process(id int64) {
 	}
 
 	runErr := p.runHandler(job)
+
+	// Shutdown interrupted the handler: hand the job back unfinished rather
+	// than counting it as a failure.
+	if runErr != nil && p.handlerCtx.Err() != nil {
+		p.release(job)
+		return
+	}
 
 	ctx, cancel = context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
@@ -282,7 +308,7 @@ func (p *Pool) runHandler(job store.Job) (err error) {
 	if !ok {
 		return Permanent(fmt.Errorf("no handler for job type %q", job.Type))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.JobTimeout)
+	ctx, cancel := context.WithTimeout(p.handlerCtx, p.cfg.JobTimeout)
 	defer cancel()
 	defer func() {
 		if r := recover(); r != nil {
@@ -290,6 +316,22 @@ func (p *Pool) runHandler(job store.Job) (err error) {
 		}
 	}()
 	return h(ctx, job.Payload)
+}
+
+// release returns a job that shutdown interrupted: pending again in Postgres
+// (the attempt is not counted) and back at the front of the Redis queue.
+func (p *Pool) release(job store.Job) {
+	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+	defer cancel()
+	ok, err := p.Store.Release(ctx, job, p.Now())
+	if err != nil {
+		// The lease will expire and the sweeper will reclaim the job.
+		p.Log.Error("release failed", "job_id", job.ID, "err", err)
+		return
+	}
+	if ok {
+		p.handBack(job.ID)
+	}
 }
 
 // handBack returns an id that was taken from Redis but never started.

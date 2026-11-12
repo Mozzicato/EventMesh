@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Mozzicato/EventMesh/internal/api"
+	"github.com/Mozzicato/EventMesh/internal/latency"
 	"github.com/Mozzicato/EventMesh/internal/queue"
 	"github.com/Mozzicato/EventMesh/internal/store"
 	"github.com/Mozzicato/EventMesh/internal/worker"
@@ -28,6 +29,7 @@ type config struct {
 	redisAddr string
 	queue     string
 	workers   int
+	bench     bool
 }
 
 func main() {
@@ -39,6 +41,8 @@ func main() {
 	flag.StringVar(&cfg.redisAddr, "redis", envOr("EVENTMESH_REDIS", "localhost:6379"), "Redis address")
 	flag.StringVar(&cfg.queue, "queue", "default", "queue this server's worker pool consumes")
 	flag.IntVar(&cfg.workers, "workers", 16, "number of worker goroutines")
+	flag.BoolVar(&cfg.bench, "bench", false,
+		"record per-job end-to-end latency and serve it at /debug/latencies/* (load tests only)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -90,9 +94,11 @@ func run(cfg config, log *slog.Logger) error {
 		Log:      log,
 		Now:      time.Now,
 	}
+	mux := http.NewServeMux()
+	mux.Handle("/", srv.Handler())
 	httpSrv := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           srv.Handler(),
+		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	pool := &worker.Pool{
@@ -102,6 +108,13 @@ func run(cfg config, log *slog.Logger) error {
 		Config:   worker.Config{Queue: cfg.queue, Workers: cfg.workers},
 		Now:      time.Now,
 		Log:      log,
+	}
+	if cfg.bench {
+		rec := &latency.Recorder{}
+		pool.OnSucceeded = rec.Record
+		mux.HandleFunc("GET /debug/latencies/count", rec.CountHandler)
+		mux.HandleFunc("POST /debug/latencies/take", rec.TakeHandler)
+		log.Info("bench mode: recording per-job latency")
 	}
 
 	httpErr := make(chan error, 1)
