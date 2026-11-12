@@ -17,6 +17,7 @@ import (
 func newJob(key string) store.NewJob {
 	return store.NewJob{
 		IdempotencyKey: key,
+		Queue:          "test",
 		Type:           "noop",
 		Payload:        json.RawMessage(`{"n":1}`),
 		MaxAttempts:    3,

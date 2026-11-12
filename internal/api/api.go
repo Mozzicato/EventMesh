@@ -25,13 +25,14 @@ const (
 
 // Enqueuer pushes a newly created job id onto the work queue (Redis).
 type Enqueuer interface {
-	Enqueue(ctx context.Context, id int64) error
+	Enqueue(ctx context.Context, queue string, id int64) error
 }
 
 // Server holds the API's dependencies.
 type Server struct {
 	Store    *store.Store
 	Queue    Enqueuer        // may be nil: jobs are still stored, the sweeper enqueues them later
+	Queues   map[string]bool // queue names that have a worker pool
 	JobTypes map[string]bool // job types that have a registered handler
 	Log      *slog.Logger
 	Now      func() time.Time
@@ -48,6 +49,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 type submitRequest struct {
+	Queue       string          `json:"queue"`
 	Type        string          `json:"type"`
 	Payload     json.RawMessage `json:"payload"`
 	MaxAttempts int             `json:"max_attempts"`
@@ -68,6 +70,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if req.Queue == "" {
+		req.Queue = "default"
+	}
+	if !s.Queues[req.Queue] {
+		writeError(w, http.StatusBadRequest, "unknown queue: "+strconv.Quote(req.Queue))
 		return
 	}
 	if !s.JobTypes[req.Type] {
@@ -98,6 +107,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 
 	job, created, err := s.Store.CreateJob(r.Context(), store.NewJob{
 		IdempotencyKey: key,
+		Queue:          req.Queue,
 		Type:           req.Type,
 		Payload:        req.Payload,
 		MaxAttempts:    req.MaxAttempts,
@@ -121,7 +131,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if s.Queue != nil {
 		// The job is already durable in Postgres. If Redis is down, the sweeper
 		// will find this pending job and enqueue it later, so we still say 201.
-		if err := s.Queue.Enqueue(r.Context(), job.ID); err != nil {
+		if err := s.Queue.Enqueue(r.Context(), job.Queue, job.ID); err != nil {
 			s.Log.Warn("enqueue failed; sweeper will retry", "job_id", job.ID, "err", err)
 		}
 	}

@@ -27,7 +27,7 @@ type fakeQueue struct {
 	err error
 }
 
-func (q *fakeQueue) Enqueue(_ context.Context, id int64) error {
+func (q *fakeQueue) Enqueue(_ context.Context, _ string, id int64) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.err != nil {
@@ -48,6 +48,7 @@ func newServer(t *testing.T, q *fakeQueue) *httptest.Server {
 	srv := &api.Server{
 		Store:    testutil.Store(t),
 		Queue:    q,
+		Queues:   map[string]bool{"default": true},
 		JobTypes: map[string]bool{"noop": true},
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:      time.Now,
@@ -199,6 +200,7 @@ func TestSubmit_RejectsInvalidInput(t *testing.T) {
 		{"malformed json", "", `{"type":`},
 		{"unknown type", "", `{"type":"nope"}`},
 		{"missing type", "", `{"payload":{}}`},
+		{"unknown queue", "", `{"queue":"nope","type":"noop"}`},
 		{"unknown field", "", `{"type":"noop","extra":1}`},
 		{"max_attempts negative", "", `{"type":"noop","max_attempts":-1}`},
 		{"max_attempts too big", "", `{"type":"noop","max_attempts":26}`},

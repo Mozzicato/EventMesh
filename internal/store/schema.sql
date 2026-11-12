@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- The UNIQUE constraint is what enforces idempotency. Two concurrent
     -- inserts with the same key cannot both succeed, no matter how they race.
     idempotency_key TEXT        NOT NULL UNIQUE,
+    queue           TEXT        NOT NULL,
     type            TEXT        NOT NULL,
     payload         JSONB       NOT NULL,
     status          TEXT        NOT NULL
@@ -23,7 +24,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 -- Only unfinished jobs are scanned by the sweeper, so index only those.
-CREATE INDEX IF NOT EXISTS jobs_unfinished_idx ON jobs (status)
+CREATE INDEX IF NOT EXISTS jobs_unfinished_idx ON jobs (queue, status)
     WHERE status IN ('pending', 'running', 'retrying');
 
 CREATE INDEX IF NOT EXISTS jobs_dead_idx ON jobs (id) WHERE status = 'dead';

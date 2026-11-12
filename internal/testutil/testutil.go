@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/Mozzicato/EventMesh/internal/store"
 )
 
@@ -41,6 +43,19 @@ func Store(t testing.TB) *store.Store {
 	}
 	t.Cleanup(s.Close)
 	return s
+}
+
+// Redis connects to the test Redis and closes the client after the test.
+func Redis(t testing.TB) *redis.Client {
+	t.Helper()
+	rdb := redis.NewClient(&redis.Options{Addr: RedisAddr()})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Fatalf("connect redis (is `docker compose up -d` running?): %v", err)
+	}
+	t.Cleanup(func() { rdb.Close() })
+	return rdb
 }
 
 // RandomID returns a random hex string, used to keep tests from colliding on
